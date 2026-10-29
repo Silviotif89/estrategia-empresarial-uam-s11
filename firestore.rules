@@ -1,0 +1,86 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signed() { return request.auth != null; }
+    function isTeacher(sid) {
+      return signed() && get(/databases/$(database)/documents/sesiones/$(sid)).data.ownerUid == request.auth.uid;
+    }
+    function validOption(stage, id, cost) {
+      return (stage == 0 && ((id == 'a1' && cost == 7) || (id == 'a3' && cost == 12) || (id == 'a4' && cost == 6) || (id == 'a5' && cost == 16)))
+        || (stage == 1 && ((id == 'b1' && cost == 6) || (id == 'b2' && cost == 11) || (id == 'b3' && cost == 13) || (id == 'b5' && cost == 12)))
+        || (stage == 2 && ((id == 'c1' && cost == 8) || (id == 'c2' && cost == 15) || (id == 'c3' && cost == 7) || (id == 'c4' && cost == 5)))
+        || (stage == 3 && ((id == 'd1' && cost == 5) || (id == 'd3' && cost == 10) || (id == 'd4' && cost == 9) || (id == 'd5' && cost == 12)))
+        || (stage == 4 && ((id == 'e1' && cost == 6) || (id == 'e2' && cost == 7) || (id == 'e3' && cost == 9) || (id == 'e4' && cost == 11)));
+    }
+    function validDecision(d, stage) {
+      return d is map && d.stage == stage && d.options is list
+        && d.options.size() >= 2 && d.options.size() <= 4
+        && d.reason is string && d.reason.size() >= 18
+        && d.cost is int
+        && d.options[0] is map && validOption(stage, d.options[0].id, d.options[0].cost)
+        && d.options[1] is map && validOption(stage, d.options[1].id, d.options[1].cost)
+        && d.options[0].id != d.options[1].id
+        && (d.options.size() < 3 || (d.options[2] is map && validOption(stage, d.options[2].id, d.options[2].cost) && d.options[0].id != d.options[2].id && d.options[1].id != d.options[2].id))
+        && (d.options.size() < 4 || (d.options[3] is map && validOption(stage, d.options[3].id, d.options[3].cost) && d.options[0].id != d.options[3].id && d.options[1].id != d.options[3].id && d.options[2].id != d.options[3].id))
+        && d.cost == d.options[0].cost + d.options[1].cost + (d.options.size() > 2 ? d.options[2].cost : 0) + (d.options.size() > 3 ? d.options[3].cost : 0);
+    }
+    function sameHistory(next, old) {
+      return old.decisions.size() == 0
+        || (next.decisions[0] == old.decisions[0]
+          && (old.decisions.size() < 2 || next.decisions[1] == old.decisions[1])
+          && (old.decisions.size() < 3 || next.decisions[2] == old.decisions[2])
+          && (old.decisions.size() < 4 || next.decisions[3] == old.decisions[3])
+          && (old.decisions.size() < 5 || next.decisions[4] == old.decisions[4]));
+    }
+    function totalCost(ds) {
+      return (ds.size() > 0 ? ds[0].cost : 0)
+        + (ds.size() > 1 ? ds[1].cost : 0)
+        + (ds.size() > 2 ? ds[2].cost : 0)
+        + (ds.size() > 3 ? ds[3].cost : 0)
+        + (ds.size() > 4 ? ds[4].cost : 0);
+    }
+    function validAppend(next, old) {
+      return next.diff(old).affectedKeys().hasOnly(['decisions', 'status', 'updatedAt'])
+        && old.decisions is list && next.decisions is list && old.decisions.size() < 5
+        && next.decisions.size() == old.decisions.size() + 1
+        && sameHistory(next, old)
+        && validDecision(next.decisions[old.decisions.size()], old.decisions.size())
+        && totalCost(next.decisions) <= 100
+        && next.status == (next.decisions.size() == 5 ? 'ready_to_submit' : 'in_progress')
+        && next.updatedAt is int;
+    }
+    function validFinalize(next, old) {
+      return next.diff(old).affectedKeys().hasOnly(['status', 'submittedAt', 'finishedAt', 'updatedAt'])
+        && old.status == 'ready_to_submit' && old.decisions is list && old.decisions.size() == 5
+        && next.status == 'finalized' && next.submittedAt == request.time
+        && next.finishedAt == request.time && next.updatedAt == request.time;
+    }
+    function validPresentationChange(sid, next, old) {
+      return isTeacher(sid)
+        && next.diff(old).affectedKeys().hasOnly(['status', 'presentedAt', 'updatedAt'])
+        && ((old.status == 'finalized' && next.status == 'presented' && next.presentedAt == request.time && next.updatedAt == request.time)
+          || (old.status == 'presented' && next.status == 'finalized' && next.presentedAt == null && next.updatedAt == request.time));
+    }
+    match /sesiones/{sid} {
+      allow create: if signed() && request.auth.token.firebase.sign_in_provider == 'password'
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.keys().hasAll(['ownerUid', 'presented', 'rouletteHistory', 'createdAt', 'title']);
+      allow get: if signed();
+      allow list: if false;
+      allow update, delete: if isTeacher(sid);
+      match /equipos/{uid} {
+        allow read: if isTeacher(sid) || (signed() && request.auth.uid == uid);
+        allow create: if signed() && request.auth.uid == uid && request.resource.data.uid == uid
+          && request.resource.data.keys().hasAll(['uid', 'name', 'members', 'decisions', 'createdAt', 'updatedAt', 'finishedAt', 'submittedAt', 'status'])
+          && request.resource.data.status == 'registered' && request.resource.data.decisions is list
+          && request.resource.data.decisions.size() == 0 && request.resource.data.submittedAt == null;
+        allow update: if signed() && ((request.auth.uid == uid && resource.data.uid == uid && request.resource.data.uid == uid
+          && (validAppend(request.resource.data, resource.data) || validFinalize(request.resource.data, resource.data)) )
+          || validPresentationChange(sid, request.resource.data, resource.data));
+        allow delete: if isTeacher(sid);
+      }
+    }
+  }
+}
+
+
